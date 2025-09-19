@@ -15,6 +15,57 @@ const MAX_SEARCH_TIME_MS: u64 = 500; // Max time to spend searching (millisecond
 const MAX_IGNORE_PATTERNS: usize = 100; // Upper bound on loaded ignore patterns
 const MAX_COMPILED_REGEX_SIZE: usize = 1_000_000; // 1MB compiled regex size limit
 
+/// Get the current working directory preserving symlinks using PWD environment variable
+/// Falls back to env::current_dir() if PWD is not available or invalid
+fn get_current_dir_preserving_symlinks() -> Result<PathBuf, std::io::Error> {
+    // Try to use PWD environment variable first (preserves symlinks)
+    if let Ok(pwd) = env::var("PWD") {
+        let pwd_path = PathBuf::from(&pwd);
+        
+        // Verify that PWD actually points to the same directory as the canonical current dir
+        if let Ok(canonical_current) = env::current_dir() {
+            if let Ok(canonical_pwd) = pwd_path.canonicalize() {
+                if canonical_pwd == canonical_current {
+                    return Ok(pwd_path);
+                }
+            }
+        }
+    }
+    
+    // Fall back to the standard method if PWD is not reliable
+    env::current_dir()
+}
+
+/// Convert a canonical path back to a symlink-preserving path
+fn preserve_symlink_in_path(canonical_path: &Path, user_cwd: &Path, canonical_cwd: &Path) -> PathBuf {
+    // If the canonical path starts with the canonical current directory,
+    // replace that prefix with the user's symlink current directory
+    if let Ok(relative_path) = canonical_path.strip_prefix(canonical_cwd) {
+        if relative_path.as_os_str().is_empty() {
+            // When the relative path is empty (i.e., canonical_path == canonical_cwd),
+            // return user_cwd directly to avoid the trailing slash from join("")
+            user_cwd.to_path_buf()
+        } else {
+            user_cwd.join(relative_path)
+        }
+    } else if let Ok(relative_to_parent) = canonical_cwd.strip_prefix(canonical_path) {
+        // Handle parent directories: navigate up from user_cwd
+        let levels_up = relative_to_parent.components().count();
+        let mut result_path = user_cwd.to_path_buf();
+        for _ in 0..levels_up {
+            if let Some(parent) = result_path.parent() {
+                result_path = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+        result_path
+    } else {
+        // If it's not related to current directory, return as-is
+        canonical_path.to_path_buf()
+    }
+}
+
 /// Get ignore file paths in priority order following XDG Base Directory Specification
 fn get_ignore_file_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -168,158 +219,112 @@ impl SearchContext {
 /// Resolves the search context by handling relative paths and directory navigation patterns.
 /// Returns (search_directory, pattern) where search_directory is the resolved starting point
 /// and pattern is the remaining search term after resolving relative components.
-fn resolve_search_context(current_dir: &Path, search_term: &str) -> (PathBuf, String) {
+fn resolve_search_context(canonical_current_dir: &Path, search_term: &str, user_current_dir: &Path) -> (PathBuf, String) {
     if is_debug_enabled() {
         eprintln!(
-            "DEBUG: resolve_search_context: current_dir={}, search_term='{}'",
-            current_dir.display(),
+            "DEBUG: resolve_search_context: canonical_current_dir={}, user_current_dir={}, search_term='{}'",
+            canonical_current_dir.display(),
+            user_current_dir.display(),
             search_term
         );
     }
 
     // Handle empty search term
     if search_term.is_empty() {
-        if is_debug_enabled() {
-            eprintln!("DEBUG: Empty search term, returning current directory");
-        }
-        return (current_dir.to_path_buf(), String::new());
+        return (canonical_current_dir.to_path_buf(), String::new());
     }
 
-    // Handle pure directory navigation without search pattern
+    // Handle simple directory navigation
     if search_term == ".." {
-        if let Some(parent) = current_dir.parent() {
-            if is_debug_enabled() {
-                eprintln!("DEBUG: Parent directory navigation to {}", parent.display());
-            }
-            return (parent.to_path_buf(), String::new());
-        } else {
-            if is_debug_enabled() {
-                eprintln!("DEBUG: Already at root, staying in current directory");
-            }
-            return (current_dir.to_path_buf(), String::new());
-        }
+        return resolve_parent_directory(user_current_dir, canonical_current_dir);
     }
 
     if search_term == "." {
-        if is_debug_enabled() {
-            eprintln!("DEBUG: Current directory navigation, staying put");
-        }
-        return (current_dir.to_path_buf(), String::new());
+        return (canonical_current_dir.to_path_buf(), String::new());
     }
 
     // Handle relative paths with patterns like "../foo", "../../bar", etc.
     if search_term.starts_with("../") || search_term.starts_with("./") {
-        let path = Path::new(search_term);
-        let mut resolved_dir = current_dir.to_path_buf();
-        let mut remaining_pattern = String::new();
-
-        if is_debug_enabled() {
-            eprintln!("DEBUG: Processing relative path pattern");
-        }
-
-        for component in path.components() {
-            match component {
-                std::path::Component::CurDir => {
-                    if is_debug_enabled() {
-                        eprintln!(
-                            "DEBUG: Current dir component, staying in {}",
-                            resolved_dir.display()
-                        );
-                    }
-                    continue;
-                }
-                std::path::Component::ParentDir => {
-                    if let Some(parent) = resolved_dir.parent() {
-                        if is_debug_enabled() {
-                            eprintln!(
-                                "DEBUG: Parent dir component, moving from {} to {}",
-                                resolved_dir.display(),
-                                parent.display()
-                            );
-                        }
-                        resolved_dir = parent.to_path_buf();
-                    }
-                }
-                std::path::Component::Normal(name) => {
-                    remaining_pattern = name.to_string_lossy().to_string();
-                    if is_debug_enabled() {
-                        eprintln!(
-                            "DEBUG: Found search pattern '{}' in relative path",
-                            remaining_pattern
-                        );
-                    }
-                    break;
-                }
-                _ => {
-                    if is_debug_enabled() {
-                        eprintln!("DEBUG: Other path component encountered");
-                    }
-                    break;
-                }
-            }
-        }
-
-        if is_debug_enabled() {
-            eprintln!(
-                "DEBUG: Resolved relative path: search_dir={}, pattern='{}'",
-                resolved_dir.display(),
-                remaining_pattern
-            );
-        }
-        return (resolved_dir, remaining_pattern);
+        return resolve_relative_path(search_term, user_current_dir);
     }
 
     // Handle multiple levels of parent directory navigation like "../../", "../../../"
     if search_term.chars().all(|c| c == '.' || c == '/') && search_term.contains("..") {
-        let mut resolved_dir = current_dir.to_path_buf();
-        let path = Path::new(search_term);
-
-        if is_debug_enabled() {
-            eprintln!("DEBUG: Processing multiple parent directory navigation");
-        }
-
-        for component in path.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    if let Some(parent) = resolved_dir.parent() {
-                        if is_debug_enabled() {
-                            eprintln!(
-                                "DEBUG: Moving up from {} to {}",
-                                resolved_dir.display(),
-                                parent.display()
-                            );
-                        }
-                        resolved_dir = parent.to_path_buf();
-                    }
-                }
-                std::path::Component::CurDir => {
-                    if is_debug_enabled() {
-                        eprintln!("DEBUG: Staying in current directory");
-                    }
-                }
-                _ => {
-                    break;
-                }
-            }
-        }
-
-        if is_debug_enabled() {
-            eprintln!(
-                "DEBUG: Final resolved directory: {}",
-                resolved_dir.display()
-            );
-        }
-        return (resolved_dir, String::new());
+        return resolve_multi_parent_navigation(search_term, user_current_dir);
     }
 
     // For absolute paths and regular patterns, use the original behavior
-    if is_debug_enabled() {
-        eprintln!(
-            "DEBUG: Using current directory for search with pattern '{}'",
-            search_term
-        );
+    (canonical_current_dir.to_path_buf(), search_term.to_string())
+}
+
+/// Helper function to resolve parent directory navigation
+fn resolve_parent_directory(user_current_dir: &Path, canonical_current_dir: &Path) -> (PathBuf, String) {
+    if let Some(user_parent) = user_current_dir.parent() {
+        if let Ok(canonical_parent) = user_parent.canonicalize() {
+            return (canonical_parent, String::new());
+        }
     }
-    (current_dir.to_path_buf(), search_term.to_string())
+    // Fallback to canonical navigation
+    if let Some(canonical_parent) = canonical_current_dir.parent() {
+        (canonical_parent.to_path_buf(), String::new())
+    } else {
+        (canonical_current_dir.to_path_buf(), String::new())
+    }
+}
+
+/// Helper function to resolve relative paths with patterns
+fn resolve_relative_path(search_term: &str, user_current_dir: &Path) -> (PathBuf, String) {
+    let path = Path::new(search_term);
+    let mut resolved_user_dir = user_current_dir.to_path_buf();
+    let mut remaining_pattern = String::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                if let Some(parent) = resolved_user_dir.parent() {
+                    resolved_user_dir = parent.to_path_buf();
+                }
+            }
+            std::path::Component::Normal(name) => {
+                remaining_pattern = name.to_string_lossy().to_string();
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    // Convert to canonical for internal operations
+    if let Ok(canonical_resolved) = resolved_user_dir.canonicalize() {
+        (canonical_resolved, remaining_pattern)
+    } else {
+        (resolved_user_dir, remaining_pattern)
+    }
+}
+
+/// Helper function to resolve multiple parent directory navigation
+fn resolve_multi_parent_navigation(search_term: &str, user_current_dir: &Path) -> (PathBuf, String) {
+    let mut resolved_user_dir = user_current_dir.to_path_buf();
+    let path = Path::new(search_term);
+
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if let Some(parent) = resolved_user_dir.parent() {
+                    resolved_user_dir = parent.to_path_buf();
+                }
+            }
+            std::path::Component::CurDir => continue,
+            _ => break,
+        }
+    }
+
+    // Convert to canonical for internal operations
+    if let Ok(canonical_resolved) = resolved_user_dir.canonicalize() {
+        (canonical_resolved, String::new())
+    } else {
+        (resolved_user_dir, String::new())
+    }
 }
 
 fn main() {
@@ -368,7 +373,8 @@ fn main() {
         process::exit(1);
     }
 
-    let current_dir = match env::current_dir() {
+    // Get current directory preserving symlinks for user experience
+    let user_current_dir = match get_current_dir_preserving_symlinks() {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!("Error: Cannot get current directory: {}", e);
@@ -376,8 +382,17 @@ fn main() {
         }
     };
 
-    // Handle relative paths and standard directory navigation
-    let (search_dir, pattern) = resolve_search_context(&current_dir, &search_term);
+    // Also get the canonical current directory for internal filesystem operations
+    let canonical_current_dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("Error: Cannot get canonical current directory: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Handle relative paths and standard directory navigation using canonical path
+    let (search_dir, pattern) = resolve_search_context(&canonical_current_dir, &search_term, &user_current_dir);
 
     if is_debug_enabled() {
         eprintln!(
@@ -399,9 +414,9 @@ fn main() {
 
     // Use threaded search with busy indicator (unless in quiet mode)
     let matches = if quiet_mode {
-        find_matching_directories(&search_dir, &pattern, case_sensitive, &ignore_patterns)
+        find_matching_directories(&search_dir, &pattern, case_sensitive, &ignore_patterns, &user_current_dir, &canonical_current_dir)
     } else {
-        search_with_progress(&search_dir, &pattern, case_sensitive, &ignore_patterns)
+        search_with_progress(&search_dir, &pattern, case_sensitive, &ignore_patterns, &user_current_dir, &canonical_current_dir)
     };
 
     if is_debug_enabled() {
@@ -423,10 +438,14 @@ fn search_with_progress(
     search_term: &str,
     case_sensitive: bool,
     ignore_patterns: &[Regex],
+    user_current_dir: &Path,
+    canonical_current_dir: &Path,
 ) -> Vec<DirectoryMatch> {
     let current_dir = current_dir.to_path_buf();
     let search_term = search_term.to_string();
     let ignore_patterns = ignore_patterns.to_vec(); // Clone for thread
+    let user_current_dir = user_current_dir.to_path_buf(); // Clone for thread
+    let canonical_current_dir = canonical_current_dir.to_path_buf(); // Clone for thread
 
     // Shared state for the search result
     let result = Arc::new(Mutex::new(None));
@@ -439,7 +458,7 @@ fn search_with_progress(
     // Start the search in a background thread
     let search_handle = thread::spawn(move || {
         let matches =
-            find_matching_directories(&current_dir, &search_term, case_sensitive, &ignore_patterns);
+            find_matching_directories(&current_dir, &search_term, case_sensitive, &ignore_patterns, &user_current_dir, &canonical_current_dir);
 
         // Store the result
         {
@@ -519,6 +538,8 @@ fn find_matching_directories(
     search_term: &str,
     case_sensitive: bool,
     ignore_patterns: &[Regex],
+    user_current_dir: &Path,
+    canonical_current_dir: &Path,
 ) -> Vec<DirectoryMatch> {
     if is_debug_enabled() {
         eprintln!(
@@ -537,7 +558,7 @@ fn find_matching_directories(
             eprintln!("DEBUG: Empty search term, returning current directory as match");
         }
         matches.push(DirectoryMatch {
-            path: current_dir.to_path_buf(),
+            path: preserve_symlink_in_path(current_dir, user_current_dir, canonical_current_dir),
             depth_from_current: 0,
             match_quality: MatchQuality::ExactDown,
         });
@@ -630,6 +651,8 @@ fn find_matching_directories(
             &mut matches,
             &mut context,
             case_sensitive,
+            user_current_dir,
+            canonical_current_dir,
         );
         if !matches.is_empty() {
             if is_debug_enabled() {
@@ -645,7 +668,7 @@ fn find_matching_directories(
 
     // 1. Search up for exact matches, then partial matches (direct path to root only)
     let up_matches =
-        search_up_tree_with_priority(current_dir, search_term, case_sensitive, ignore_patterns);
+        search_up_tree_with_priority(current_dir, search_term, case_sensitive, ignore_patterns, user_current_dir, canonical_current_dir);
     if is_debug_enabled() {
         eprintln!(
             "DEBUG: Found {} matches searching up tree",
@@ -656,7 +679,7 @@ fn find_matching_directories(
 
     // 2. Search down for all matches (exact and partial) from current directory only
     let down_matches =
-        search_down_breadth_first_all(current_dir, search_term, case_sensitive, ignore_patterns);
+        search_down_breadth_first_all(current_dir, search_term, case_sensitive, ignore_patterns, user_current_dir, canonical_current_dir);
     if is_debug_enabled() {
         eprintln!(
             "DEBUG: Found {} matches searching down tree",
@@ -684,20 +707,15 @@ fn search_up_tree_with_priority(
     search_term: &str,
     case_sensitive: bool,
     ignore_patterns: &[Regex],
+    user_current_dir: &Path,
+    canonical_current_dir: &Path,
 ) -> Vec<DirectoryMatch> {
-    if is_debug_enabled() {
-        eprintln!(
-            "DEBUG: search_up_tree_with_priority: searching for '{}', case_sensitive={}",
-            search_term, case_sensitive
-        );
-    }
-
     let mut exact_matches = Vec::new();
     let mut partial_matches = Vec::new();
     let mut current = current_dir;
     let mut depth = -1;
 
-    let search_lower = if case_sensitive {
+    let search_compare = if case_sensitive {
         search_term.to_string()
     } else {
         search_term.to_lowercase()
@@ -707,41 +725,28 @@ fn search_up_tree_with_priority(
         if let Some(name) = parent.file_name() {
             let name_str = name.to_string_lossy();
 
-            // Check if this directory should be ignored
+            // Skip ignored directories
             if should_ignore_directory(&name_str, ignore_patterns) {
-                if is_debug_enabled() {
-                    eprintln!("DEBUG: Ignoring parent directory: {}", name_str);
-                }
                 current = parent;
                 depth -= 1;
                 continue;
             }
 
-            let (name_compare, search_compare) = if case_sensitive {
-                (name_str.to_string(), search_term.to_string())
+            let name_compare = if case_sensitive {
+                name_str.to_string()
             } else {
-                (name_str.to_lowercase(), search_lower.clone())
+                name_str.to_lowercase()
             };
 
-            if is_debug_enabled() {
-                eprintln!("DEBUG: Checking parent '{}' at depth {}", name_str, depth);
-            }
-
             if name_compare == search_compare {
-                if is_debug_enabled() {
-                    eprintln!("DEBUG: Exact match found: {}", parent.display());
-                }
                 exact_matches.push(DirectoryMatch {
-                    path: parent.to_path_buf(),
+                    path: preserve_symlink_in_path(parent, user_current_dir, canonical_current_dir),
                     depth_from_current: depth,
                     match_quality: MatchQuality::ExactUp,
                 });
             } else if name_compare.contains(&search_compare) {
-                if is_debug_enabled() {
-                    eprintln!("DEBUG: Partial match found: {}", parent.display());
-                }
                 partial_matches.push(DirectoryMatch {
-                    path: parent.to_path_buf(),
+                    path: preserve_symlink_in_path(parent, user_current_dir, canonical_current_dir),
                     depth_from_current: depth,
                     match_quality: MatchQuality::PartialUp,
                 });
@@ -753,14 +758,6 @@ fn search_up_tree_with_priority(
 
     let mut result = exact_matches;
     result.extend(partial_matches);
-
-    if is_debug_enabled() {
-        eprintln!(
-            "DEBUG: search_up_tree_with_priority completed with {} matches",
-            result.len()
-        );
-    }
-
     result
 }
 
@@ -769,6 +766,8 @@ fn search_down_breadth_first_all(
     search_term: &str,
     case_sensitive: bool,
     ignore_patterns: &[Regex],
+    user_current_dir: &Path,
+    canonical_current_dir: &Path,
 ) -> Vec<DirectoryMatch> {
     if is_debug_enabled() {
         eprintln!(
@@ -831,7 +830,7 @@ fn search_down_breadth_first_all(
                                 eprintln!("DEBUG: Immediate exact match: {}", path.display());
                             }
                             let dir_match = DirectoryMatch {
-                                path: path.clone(),
+                                path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                 depth_from_current: 1,
                                 match_quality: MatchQuality::ExactDown,
                             };
@@ -842,7 +841,7 @@ fn search_down_breadth_first_all(
                                 eprintln!("DEBUG: Immediate prefix match: {}", path.display());
                             }
                             let dir_match = DirectoryMatch {
-                                path: path.clone(),
+                                path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                 depth_from_current: 1,
                                 match_quality: MatchQuality::PrefixDown,
                             };
@@ -853,7 +852,7 @@ fn search_down_breadth_first_all(
                                 eprintln!("DEBUG: Immediate partial match: {}", path.display());
                             }
                             let dir_match = DirectoryMatch {
-                                path: path.clone(),
+                                path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                 depth_from_current: 1,
                                 match_quality: MatchQuality::PartialDown,
                             };
@@ -944,7 +943,7 @@ fn search_down_breadth_first_all(
                                     );
                                 }
                                 level_matches.push(DirectoryMatch {
-                                    path: path.clone(),
+                                    path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                     depth_from_current: (depth + 1) as i32,
                                     match_quality: MatchQuality::ExactDown,
                                 });
@@ -957,7 +956,7 @@ fn search_down_breadth_first_all(
                                     );
                                 }
                                 level_matches.push(DirectoryMatch {
-                                    path: path.clone(),
+                                    path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                     depth_from_current: (depth + 1) as i32,
                                     match_quality: MatchQuality::PrefixDown,
                                 });
@@ -970,7 +969,7 @@ fn search_down_breadth_first_all(
                                     );
                                 }
                                 level_matches.push(DirectoryMatch {
-                                    path: path.clone(),
+                                    path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                     depth_from_current: (depth + 1) as i32,
                                     match_quality: MatchQuality::PartialDown,
                                 });
@@ -1006,26 +1005,9 @@ fn search_down_breadth_first_all(
 }
 
 fn finalize_matches(mut matches: Vec<DirectoryMatch>) -> Vec<DirectoryMatch> {
-    if is_debug_enabled() {
-        eprintln!("DEBUG: finalize_matches: input {} matches", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!(
-                "DEBUG:   [{}] {:?} depth={} path={}",
-                i,
-                m.match_quality,
-                m.depth_from_current,
-                m.path.display()
-            );
-        }
-    }
-
     // Remove duplicates based on path
     matches.sort_by(|a, b| a.path.cmp(&b.path));
     matches.dedup_by(|a, b| a.path == b.path);
-
-    if is_debug_enabled() {
-        eprintln!("DEBUG: After dedup: {} matches", matches.len());
-    }
 
     // Sort by priority with clear prioritization
     matches.sort_by(|a, b| {
@@ -1073,19 +1055,6 @@ fn finalize_matches(mut matches: Vec<DirectoryMatch>) -> Vec<DirectoryMatch> {
         }
     });
 
-    if is_debug_enabled() {
-        eprintln!("DEBUG: After sorting: {} matches", matches.len());
-        for (i, m) in matches.iter().enumerate() {
-            eprintln!(
-                "DEBUG:   [{}] {:?} depth={} path={}",
-                i,
-                m.match_quality,
-                m.depth_from_current,
-                m.path.display()
-            );
-        }
-    }
-
     matches
 }
 
@@ -1095,6 +1064,8 @@ fn search_path_pattern_fast(
     matches: &mut Vec<DirectoryMatch>,
     context: &mut SearchContext,
     case_sensitive: bool,
+    user_current_dir: &Path,
+    canonical_current_dir: &Path,
 ) {
     if is_debug_enabled() {
         eprintln!(
@@ -1140,6 +1111,8 @@ fn search_path_pattern_fast(
         0,
         4,
         case_sensitive,
+        user_current_dir,
+        canonical_current_dir,
     );
 
     // Also search up the tree for the first part (but limit this to avoid slowdown)
@@ -1197,7 +1170,7 @@ fn search_path_pattern_fast(
                     }
 
                     matches.push(DirectoryMatch {
-                        path: parent.to_path_buf(),
+                        path: preserve_symlink_in_path(parent, user_current_dir, canonical_current_dir),
                         depth_from_current: depth,
                         match_quality,
                     });
@@ -1215,6 +1188,8 @@ fn search_path_pattern_fast(
                         depth,
                         3,
                         case_sensitive,
+                        user_current_dir,
+                        canonical_current_dir,
                     );
                 }
             }
@@ -1241,6 +1216,8 @@ fn search_pattern_recursive_fast(
     base_depth: i32,
     max_depth: usize,
     case_sensitive: bool,
+    user_current_dir: &Path,
+    canonical_current_dir: &Path,
 ) {
     if is_debug_enabled() {
         eprintln!("DEBUG: search_pattern_recursive_fast: dir={}, pattern='{}', remaining={:?}, base_depth={}, max_depth={}, case_sensitive={}",
@@ -1316,7 +1293,7 @@ fn search_pattern_recursive_fast(
                                 }
 
                                 matches.push(DirectoryMatch {
-                                    path: path.clone(),
+                                    path: preserve_symlink_in_path(&path, user_current_dir, canonical_current_dir),
                                     depth_from_current: base_depth + 1,
                                     match_quality,
                                 });
@@ -1334,6 +1311,8 @@ fn search_pattern_recursive_fast(
                                     base_depth + 1,
                                     max_depth - 1,
                                     case_sensitive,
+                                    user_current_dir,
+                                    canonical_current_dir,
                                 );
                             }
                         }
@@ -1349,6 +1328,8 @@ fn search_pattern_recursive_fast(
                                 base_depth + 1,
                                 max_depth - 1,
                                 case_sensitive,
+                                user_current_dir,
+                                canonical_current_dir,
                             );
                         }
                     }

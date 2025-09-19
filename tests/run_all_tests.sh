@@ -83,6 +83,7 @@ run_test "Absolute Bug Test" "./test_absolute_bug.sh"
 run_test "Absolute Path Consistency Test" "./test_absolute_path_consistency.sh"
 run_test "Regression Fix Test" "./test_regression_fix.sh"
 run_test "Final Absolute Path Test" "./final_absolute_path_test.sh"
+run_test "Symlink Fix Test" "./test_symlink.sh"
 
 # Python-based tests
 run_python_test "Basic Functionality Verification (Python)" "./verify_basic_functionality.py"
